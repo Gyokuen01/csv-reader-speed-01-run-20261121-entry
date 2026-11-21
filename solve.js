@@ -1,5 +1,10 @@
-// Fast drop-in for make.fun's csv-reader 1.0.0: returns exactly csv-reader's
-// {columns, rows, errors} for every {text, header}, faster.
+// v5: fast drop-in for csv-reader 1.0.0 (policy: see v4, reproduced exactly).
+// Change vs v4: a quoted field may close on a LATER line (multi-line quoted
+// field) without bailing to the slow general parser. The closing-quote
+// search is unbounded; embedded breaks are counted, CR/CRLF normalised to
+// LF, and the line boundary is re-synced so the record continues correctly.
+// The slow path is kept only for stray CR, junk after a closing quote, and
+// an unterminated quote.
 //
 // Strategy: most records are a single line. One native regex scan finds the
 // next quote or CR; a line with neither is split natively, a line with a
@@ -196,6 +201,7 @@ export function run(input) {
         special = m.index;
       }
     }
+    let curNl = nl;
     if (special === -1 || special >= fieldEnd) {
       fields = text.slice(pos, fieldEnd).split(',');
     } else if (text.charCodeAt(special) === 13) {
@@ -204,17 +210,20 @@ export function run(input) {
       const f = [];
       let i = pos;
       let q = false;
+      // curFieldEnd is re-synced after a multi-line quoted field.
+      let curFieldEnd = fieldEnd;
       outer: for (;;) {
         if (text.charCodeAt(i) === 34) {
-          // Quoted field: find its closing quote on this line. The scan
-          // itself reports whether any "" pair was skipped (hasDD).
+          // Quoted field: find its closing quote. Unlike v4 the search is
+          // NOT bounded by the current line, so a quoted field spanning
+          // lines stays on the fast path. hasDD reports "" pairs skipped.
           q = true;
           let close = -1;
           let s = i + 1;
           let hasDD = false;
           for (;;) {
             const qi = text.indexOf('"', s);
-            if (qi === -1 || qi >= fieldEnd) {
+            if (qi === -1) {
               ok = false;
               break outer;
             }
@@ -226,22 +235,60 @@ export function run(input) {
             close = qi;
             break;
           }
-          let value = text.slice(i + 1, close);
-          if (value.indexOf('\r') !== -1) {
-            ok = false; // CR inside the quotes: general parser
-            break outer;
-          }
+          // The value may span lines: count the breaks it holds and move
+          // the line counter, normalising CR/CRLF to LF when present.
+          const seg = text.slice(i + 1, close);
+          let value = seg;
           if (hasDD) value = value.replaceAll('""', '"');
+          const segCR = seg.indexOf('\r');
+          const segLF = seg.indexOf('\n');
+          if (segCR !== -1) {
+            value = value.replace(/\r\n?/g, '\n');
+            let n = 0;
+            let a = -1;
+            while ((a = seg.indexOf('\n', a + 1)) !== -1) n += 1;
+            let b = -1;
+            while ((b = seg.indexOf('\r', b + 1)) !== -1) {
+              if (seg.charCodeAt(b + 1) !== 10) n += 1;
+            }
+            line += n;
+          } else if (segLF !== -1) {
+            let n = 0;
+            let a = segLF - 1;
+            while ((a = seg.indexOf('\n', a + 1)) !== -1) n += 1;
+            line += n;
+          }
           const after = close + 1;
-          if (after === fieldEnd) {
+          if (after >= len) {
             f.push(value);
+            // Record ends at end of text; mark it by moving nl to -1.
+            curNl = -1;
             break;
           }
-          if (text.charCodeAt(after) === 44) {
+          const ac = text.charCodeAt(after);
+          if (ac === 44) {
             f.push(value);
             i = after + 1;
             q = false;
+            // Re-sync the line boundary for the field that follows: it may
+            // sit on a later line than the one this record started on.
+            if (after >= curFieldEnd) {
+              curNl = text.indexOf('\n', after);
+              curFieldEnd = curNl === -1 ? len : curNl;
+              if (curNl !== -1 && curFieldEnd > after && text.charCodeAt(curFieldEnd - 1) === 13) curFieldEnd -= 1;
+            }
             continue;
+          }
+          if (ac === 10) {
+            f.push(value);
+            // Record ends at this LF; consume it as the line break.
+            curNl = after;
+            break;
+          }
+          if (ac === 13 && text.charCodeAt(after + 1) === 10) {
+            f.push(value);
+            curNl = after + 1;
+            break;
           }
           ok = false; // junk after the closing quote: general parser
           break outer;
@@ -249,8 +296,8 @@ export function run(input) {
         // Unquoted field: up to the next comma (a quote inside it is literal).
         q = false;
         const ci = text.indexOf(',', i);
-        if (ci === -1 || ci >= fieldEnd) {
-          const v = text.slice(i, fieldEnd);
+        if (ci === -1 || ci >= curFieldEnd) {
+          const v = text.slice(i, curFieldEnd);
           if (v.indexOf('\r') !== -1) {
             ok = false; // stray CR in the field: general parser
             break outer;
@@ -279,14 +326,26 @@ export function run(input) {
       } else {
         emit(fields, lastQuoted);
       }
-      pos = nl === -1 ? len : nl + 1;
-      line += 1;
+      // Advance past the record's line break. The quote branch may have
+      // ended the record at curNl (a later line, or -1 at end of text);
+      // the clean-split path always ends at nl.
+      const advNl = typeof curNl !== 'undefined' ? curNl : nl;
+      if (advNl === -1) {
+        pos = len;
+      } else {
+        pos = advNl + 1;
+        line += 1;
+      }
       continue;
     }
 
     // Slow path: this record holds a stray CR, a quoted field spanning
     // lines, junk after a closing quote, or a quote that never closes.
     // Parsed field by field, exactly as csv-reader 1.0.0 does.
+    // The fast path above may already have advanced `line` for breaks
+    // inside a multi-line quoted field; the slow path re-parses from the
+    // record's start and counts them itself, so restore the start line.
+    line = recordLine;
     fields = [];
     let quoted = false;
     let ended = COMMA;
